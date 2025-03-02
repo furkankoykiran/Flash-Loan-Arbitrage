@@ -1,277 +1,262 @@
+from typing import Dict, List, Optional
 import os
-import logging
-from typing import Dict, Optional
-from decimal import Decimal
 from dotenv import load_dotenv
 from web3 import Web3
-from web3.providers.websocket import WebsocketProvider
-from web3.middleware import geth_poa_middleware
 import json
-import time
-import asyncio
+import logging
+from decimal import Decimal
+import requests
 
-from .notifications import TelegramNotifier
 from .market_utils import MarketUtils
+from .notifications import TelegramNotifier
+from .token_discovery import TokenDiscovery
 
 logger = logging.getLogger(__name__)
 
 class Config:
     def __init__(self):
+        # Load environment variables
         load_dotenv()
         
-        # Network configuration
-        self.rpc_url = os.getenv('NETWORK_RPC_URL')
-        self.backup_urls = os.getenv('BACKUP_RPC_URLS', '').split(',') if os.getenv('BACKUP_RPC_URLS') else []
-        self.chain_id = int(os.getenv('CHAIN_ID', '1'))
-        self.current_rpc_index = 0
-        self.available_rpcs = [self.rpc_url] + [url for url in self.backup_urls if url.strip()]
+        # Node connection
+        self.network_rpc = os.getenv('NETWORK_RPC_URL')
+        self.backup_rpcs = os.getenv('BACKUP_RPC_URLS', '').split(',')
         
-        # Initialize Web3 with WebSocket provider
-        self.w3 = self._initialize_web3()
-        if not self.w3:
-            self._try_backup_rpcs()
-        
-        # Wallet configuration
-        self.private_key = os.getenv('PRIVATE_KEY')
+        # Wallet settings
         self.wallet_address = os.getenv('WALLET_ADDRESS')
-        
-        if self.private_key and self.wallet_address:
-            logger.info(f"Wallet configured: {self.wallet_address}")
-        
-        # Contract addresses
-        self.uniswap_router = os.getenv('UNISWAP_ROUTER_ADDRESS')
-        self.sushiswap_router = os.getenv('SUSHISWAP_ROUTER_ADDRESS')
+        self.private_key = os.getenv('PRIVATE_KEY')
         
         # Trading parameters
-        self.slippage_tolerance = int(os.getenv('SLIPPAGE_TOLERANCE', '50'))
+        self.min_profit_threshold = float(os.getenv('MIN_PROFIT_THRESHOLD', '0.01'))
         self.max_gas_price = int(os.getenv('MAX_GAS_PRICE', '100'))
-        self.min_profit_threshold = Decimal(os.getenv('MIN_PROFIT_THRESHOLD', '0.00005'))
+        self.slippage_tolerance = int(os.getenv('SLIPPAGE_TOLERANCE', '100'))  # basis points
         
-        # Token configuration
-        self.token_addresses = {}
-        self.token_ids = {}
-        self.min_liquidity = float(os.getenv('MIN_LIQUIDITY_USD', '100000'))  # Minimum liquidity in USD
-        self.min_volume = float(os.getenv('MIN_VOLUME_USD', '50000'))  # Minimum 24h volume in USD
-        self.token_blacklist = set(os.getenv('TOKEN_BLACKLIST', '').split(','))
-        self.token_whitelist = set(os.getenv('TOKEN_WHITELIST', '').split(','))
+        # Token discovery settings
+        self.min_liquidity_usd = float(os.getenv('MIN_LIQUIDITY_USD', '5000').strip())
+        self.min_volume_usd = float(os.getenv('MIN_VOLUME_USD', '1000').strip())
+        self.token_blacklist = [
+            addr.strip().lower() 
+            for addr in os.getenv('TOKEN_BLACKLIST', '').split(',') 
+            if addr.strip()
+        ]
+        self.token_whitelist = [
+            addr.strip().lower() 
+            for addr in os.getenv('TOKEN_WHITELIST', '').split(',') 
+            if addr.strip()
+        ]
         
-        # Initialize token discovery
-        if self.w3 and self.w3.is_connected():
-            from .token_discovery import TokenDiscovery
-            self.token_discovery = TokenDiscovery(self.w3)
-            self.token_discovery.min_liquidity_usd = self.min_liquidity
-            self.token_discovery.min_volume_usd = self.min_volume
-        else:
-            self.token_discovery = None
+        # DEX settings
+        self.enabled_dexes = [
+            dex.strip().lower() 
+            for dex in os.getenv('ENABLED_DEXES', '').split(',') 
+            if dex.strip()
+        ]
+        self.dex_weights = json.loads(os.getenv('DEX_WEIGHTS', '{}'))
+        self.new_dex_delay = int(os.getenv('NEW_DEX_DELAY', '3600'))
+        self.max_trade_hops = int(os.getenv('MAX_TRADE_HOPS', '3'))
         
-        # Initialize market utils
-        if self.w3 and self.w3.is_connected():
-            self.market_utils = MarketUtils(self.w3)
-            logger.info("Market utils initialized")
-        else:
-            self.market_utils = None
-            logger.error("Failed to initialize market utils - no Web3 connection")
+        # Security settings
+        self.max_exposure = float(os.getenv('MAX_EXPOSURE', '1.0'))
+        self.verify_contracts = os.getenv('SMART_CONTRACT_VERIFICATION', 'true').lower() == 'true'
+        self.min_token_age = int(os.getenv('MIN_TOKEN_AGE', '1'))
+        self.required_audit_score = int(os.getenv('REQUIRED_AUDIT_SCORE', '70'))
         
-        # Telegram configuration
-        self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
-        self.telegram_channel = os.getenv('TELEGRAM_CHANNEL_ID')
+        # Initialize Web3
+        self.w3 = None
+        self._initialize_web3()
         
-        # Initialize Telegram notifier
-        if self.telegram_token and self.telegram_channel:
-            self.notifier = TelegramNotifier(self.telegram_token, self.telegram_channel)
-            logger.info("Telegram notifications enabled")
-        else:
-            self.notifier = None
-            logger.info("Telegram notifications disabled (missing configuration)")
-            
-        # Bot statistics
+        # Initialize statistics
         self.stats = {
             'opportunities_found': 0,
             'successful_trades': 0,
             'failed_trades': 0,
             'total_profit_eth': Decimal('0'),
-            'total_profit_usd': Decimal('0')
+            'total_profit_usd': Decimal('0'),
+            'total_gas_used': Decimal('0')
         }
 
-    def _initialize_web3(self) -> Optional[Web3]:
-        """Initialize Web3 with WebSocket provider"""
+        # Initialize components
+        self.market_utils = MarketUtils(self.w3)
+        self.token_discovery = TokenDiscovery(self.w3)
+        
+        # Initialize notifier (optional)
+        self.notifier = self._initialize_notifier()
+        if self.notifier and not self.notifier.is_enabled():
+            logger.info("Telegram notifications disabled - missing or invalid configuration")
+            self.notifier = None
+        
+        # Trading pairs
+        self.token_addresses = {}
+        self.trading_pairs = {}
+
+    def _test_node_connection(self, url: str) -> bool:
+        """Test if a node is responsive"""
         try:
-            if not self.rpc_url:
-                raise ValueError("NETWORK_RPC_URL not found in .env")
-            
-            if not self.rpc_url.startswith(('ws://', 'wss://')):
-                raise ValueError("NETWORK_RPC_URL must be a WebSocket URL starting with ws:// or wss://")
-            
-            # Configure WebSocket provider
-            provider_kwargs = {
-                'websocket_timeout': 60,
-                'websocket_kwargs': {
-                    'ping_interval': 30,
-                    'ping_timeout': 10,
-                    'max_size': 2**22,
-                }
+            headers = {'Content-Type': 'application/json'}
+            payload = {
+                'jsonrpc': '2.0',
+                'method': 'eth_blockNumber',
+                'params': [],
+                'id': 1
             }
+            response = requests.post(url, json=payload, headers=headers, timeout=5)
+            return response.status_code == 200 and 'result' in response.json()
+        except Exception as e:
+            logger.debug(f"Node connection test failed for {url}: {str(e)}")
+            return False
+
+    def _initialize_web3(self):
+        """Initialize Web3 with primary and backup nodes"""
+        try:
+            # Use default Ethereum nodes if none are specified
+            if not self.network_rpc:
+                self.network_rpc = "https://rpc.ankr.com/eth"
+                self.backup_rpcs = [
+                    "https://eth.rpc.blxrbdn.com",
+                    "https://ethereum.publicnode.com",
+                    "https://1rpc.io/eth"
+                ]
             
-            provider = WebsocketProvider(self.rpc_url, **provider_kwargs)
+            # Try primary node
+            if self._test_node_connection(self.network_rpc):
+                self.w3 = self._create_web3_instance(self.network_rpc)
+                if self.w3 and self.w3.is_connected():
+                    logger.info(f"Connected to primary node: {self.network_rpc}")
+                    return
+            
+            # Try backup nodes
+            for backup_rpc in self.backup_rpcs:
+                if not backup_rpc:
+                    continue
+                if self._test_node_connection(backup_rpc):
+                    try:
+                        self.w3 = self._create_web3_instance(backup_rpc)
+                        if self.w3 and self.w3.is_connected():
+                            logger.info(f"Connected to backup node: {backup_rpc}")
+                            return
+                    except Exception as e:
+                        logger.warning(f"Failed to connect to backup node {backup_rpc}: {str(e)}")
+            
+            raise ConnectionError("Failed to connect to any nodes")
+            
+        except Exception as e:
+            logger.error(f"Error initializing Web3: {str(e)}")
+            raise
+
+    def _create_web3_instance(self, rpc_url: str) -> Optional[Web3]:
+        """Create Web3 instance with appropriate provider"""
+        try:
+            provider = Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 30})
             w3 = Web3(provider)
             
-            # Add middleware
-            w3.middleware_onion.inject(geth_poa_middleware, layer=0)
-            
-            # Test connection with retries
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    if w3.is_connected() and w3.eth.chain_id == self.chain_id:
-                        logger.info(f"Connected to Ethereum network (Chain ID: {self.chain_id})")
-                        return w3
-                except Exception:
-                    if attempt < max_retries - 1:
-                        time.sleep(1)
-                        continue
-                    raise
-            
-            raise ConnectionError("Failed to establish connection after multiple attempts")
-            
-        except Exception as e:
-            logger.error(f"Web3 initialization failed for {self.rpc_url}: {str(e)}")
-            return None
-            
-    def _try_backup_rpcs(self) -> Optional[Web3]:
-        """Try connecting to backup RPC endpoints"""
-        if not self.backup_urls:
-            return None
-            
-        for i, url in enumerate(self.backup_urls):
-            if not url.strip():
-                continue
-                
+            # Test the connection with a simple call
             try:
-                self.rpc_url = url
-                self.current_rpc_index = i + 1
-                logger.info(f"Attempting connection to backup RPC: {url}")
-                w3 = self._initialize_web3()
-                if w3 and w3.is_connected():
-                    logger.info(f"Successfully connected to backup RPC: {url}")
-                    self.w3 = w3
-                    return w3
+                w3.eth.block_number
             except Exception as e:
-                logger.error(f"Failed to connect to backup RPC {url}: {str(e)}")
-                continue
-        
-        return None
-        
-    def _reconnect(self) -> bool:
-        """Attempt to reconnect using current or backup RPCs"""
-        if self.w3 and self.w3.is_connected():
-            return True
-            
-        logger.info("Connection lost, attempting to reconnect...")
-        
-        # Try current RPC first
-        self.w3 = self._initialize_web3()
-        if self.w3 and self.w3.is_connected():
-            return True
-            
-        # Try backup RPCs
-        self.w3 = self._try_backup_rpcs()
-        return bool(self.w3 and self.w3.is_connected())
-        
-    def validate_config(self) -> bool:
-        """Validate that all required configuration is present"""
-        if not self.w3 or not self.w3.is_connected():
-            return False
-            
-        required_fields = [
-            self.private_key,
-            self.wallet_address,
-            self.uniswap_router,
-            self.sushiswap_router
+                logger.error(f"Failed to get block number from {rpc_url}: {str(e)}")
+                return None
+                
+            return w3 if w3.is_connected() else None
+        except Exception as e:
+            logger.error(f"Failed to create Web3 instance for {rpc_url}: {str(e)}")
+            return None
+
+    def validate_config(self):
+        """Validate required configuration settings"""
+        required_settings = [
+            ('PRIVATE_KEY', self.private_key),
+            ('WALLET_ADDRESS', self.wallet_address)
         ]
         
-        missing_fields = [i for i, field in enumerate(required_fields) if not field]
-        if missing_fields:
-            logger.error(f"Missing required configuration fields at indices: {missing_fields}")
-            return False
-            
-        # Check wallet address format
-        try:
-            if not self.w3.is_address(self.wallet_address):
-                logger.error(f"Invalid wallet address format: {self.wallet_address}")
+        for setting_name, value in required_settings:
+            if not value:
+                logger.error(f'Missing required setting: {setting_name}')
                 return False
-            
-            # Verify wallet has balance
-            balance = self.w3.eth.get_balance(self.wallet_address)
-            eth_balance = float(self.w3.from_wei(balance, 'ether'))
-            logger.info(f"Wallet balance: {eth_balance:.6f} ETH")
-            
-        except Exception as e:
-            logger.error(f"Error validating wallet: {str(e)}")
-            return False
-            
         return True
-        
-    async def update_token_list(self):
-        """Update the list of monitored tokens"""
-        if not self.token_discovery:
-            logger.error("Token discovery not initialized")
-            return
-            
-        try:
-            discovered_tokens = await self.token_discovery.discover_tokens()
-            
-            # Reset token mappings
-            self.token_addresses.clear()
-            self.token_ids.clear()
-            
-            # Filter and add discovered tokens
-            for token_id, token_data in discovered_tokens.items():
-                symbol = token_data['symbol']
-                
-                # Skip blacklisted tokens
-                if symbol in self.token_blacklist:
-                    continue
-                    
-                # Only include whitelisted tokens if whitelist is not empty
-                if self.token_whitelist and symbol not in self.token_whitelist:
-                    continue
-                    
-                # Add token to mappings
-                self.token_addresses[symbol] = token_data['address']
-                self.token_ids[symbol] = token_id
-                
-            logger.info(f"Updated token list with {len(self.token_addresses)} tokens")
-            
-            # Log monitored tokens
-            logger.info("\nMonitored tokens:")
-            for symbol, address in self.token_addresses.items():
-                logger.info(f"{symbol}: {address}")
-                
-        except Exception as e:
-            logger.error(f"Error updating token list: {str(e)}")
-    
-    def is_connected(self) -> bool:
-        """Check if Web3 is connected to the network and attempt reconnection if needed"""
-        try:
-            if self.w3 and self.w3.is_connected() and self.w3.eth.chain_id == self.chain_id:
-                return True
-                
-            logger.warning("Connection lost, attempting to reconnect...")
-            if self._reconnect():
-                logger.info(f"Successfully reconnected to RPC: {self.rpc_url}")
-                return True
-                
-            logger.error("Failed to connect to all RPC endpoints")
-            return False
-            
-        except Exception as e:
-            logger.error(f"Connection check failed: {str(e)}")
-            return self._reconnect()
 
     async def close(self):
         """Clean up resources"""
-        if self.notifier:
-            await self.notifier.close()
+        try:
+            if self.market_utils:
+                await self.market_utils.close()
+            if hasattr(self.w3.provider, 'disconnect'):
+                await self.w3.provider.disconnect()
+        except Exception as e:
+            logger.error(f'Error during cleanup: {str(e)}')
+
+    def _initialize_notifier(self) -> Optional[TelegramNotifier]:
+        """Initialize Telegram notification handler"""
+        telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
+        telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
         
-        if hasattr(self.w3.provider, 'ws'):
-            await self.w3.provider.ws.close()
+        if telegram_token and telegram_chat_id:
+            return TelegramNotifier(telegram_token, telegram_chat_id)
+        return None
+
+    async def update_token_list(self):
+        """Update tradeable token list"""
+        try:
+            discovered_tokens = await self.token_discovery.discover_tokens()
+            
+            valid_tokens = {}
+            for symbol, token_data in discovered_tokens.items():
+                if symbol in self.token_blacklist:
+                    continue
+                
+                if self.token_whitelist and self.token_whitelist[0] and symbol not in self.token_whitelist:
+                    continue
+
+                if not token_data.get('pairs', []):
+                    continue
+
+                has_sufficient_liquidity = False
+                total_volume_usd = 0
+
+                for pair in token_data['pairs']:
+                    liquidity = pair.get('reserve_usd', 0)
+                    if liquidity >= self.min_liquidity_usd:
+                        has_sufficient_liquidity = True
+                        total_volume_usd += liquidity * 0.1
+
+                if not has_sufficient_liquidity or total_volume_usd < self.min_volume_usd:
+                    continue
+
+                valid_tokens[symbol] = token_data['address']
+            
+            self.token_addresses = valid_tokens
+            logger.info(f"Updated token list with {len(valid_tokens)} tokens")
+            
+        except Exception as e:
+            logger.error(f"Error updating token list: {str(e)}")
+
+    def is_connected(self) -> bool:
+        """Check if connected to Ethereum node"""
+        return self.w3 and self.w3.is_connected()
+
+    async def is_gas_price_acceptable(self) -> bool:
+        """Check if current gas price is below maximum"""
+        try:
+            current_gas_price = self.w3.from_wei(self.w3.eth.gas_price, 'gwei')
+            return current_gas_price <= self.max_gas_price
+        except Exception as e:
+            logger.error(f"Error checking gas price: {str(e)}")
+            return False
+
+    def get_enabled_dexes(self) -> List[str]:
+        """Get list of enabled DEXes"""
+        if not self.enabled_dexes:
+            return ['uniswap_v2', 'sushiswap', 'uniswap_v3', 'pancakeswap']
+        return self.enabled_dexes
+
+    def get_dex_weight(self, dex_id: str) -> float:
+        """Get routing weight for a DEX"""
+        return float(self.dex_weights.get(dex_id, 1.0))
+
+    def is_new_dex_allowed(self, dex_id: str, creation_time: int) -> bool:
+        """Check if a new DEX meets the minimum age requirement"""
+        current_time = self.w3.eth.get_block('latest')['timestamp']
+        return (current_time - creation_time) >= self.new_dex_delay
+
+    def get_max_exposure(self, token_symbol: str) -> float:
+        """Get maximum exposure allowed for a token"""
+        return self.max_exposure
