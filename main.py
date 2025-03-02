@@ -3,11 +3,10 @@ import logging
 import asyncio
 from decimal import Decimal
 import argparse
-from web3 import Web3
 import signal
 
-from .config import Config
-from .arbitrage_bot import ArbitrageBot
+from src.config import Config
+from src.arbitrage_bot import ArbitrageBot
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,7 +63,7 @@ async def run_arbitrage_bot():
         if not config.validate_config():
             logger.error("""
 Missing required configuration. Please check your .env file and ensure all required values are set:
-- NETWORK_RPC_URL (should be WebSocket URL starting with ws://)
+- NETWORK_RPC_URL (should be WebSocket URL starting with wss://)
 - PRIVATE_KEY
 - WALLET_ADDRESS
             """)
