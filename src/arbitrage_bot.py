@@ -1,4 +1,4 @@
-from typing import List, Dict
+from typing import List, Dict, Optional
 from web3 import Web3
 from web3.contract import Contract
 from decimal import Decimal
@@ -23,17 +23,26 @@ class ArbitrageBot:
         self.config = config
         self.w3 = config.w3
         self.contracts = ContractInterface(self.w3, config)
-        self.market_utils = config.market_utils
+        self.market_utils = MarketUtils(self.w3, self.contracts)
         self.notifier = config.notifier
         self.start_time = datetime.now()
         self.trading_pairs = {}
         self.token_contracts = {}
         self._initialized = False
-        self.uniswap_router = None
-        self.sushiswap_router = None
-        self.wbtc_contract = None
-        self.usdt_contract = None
         self._shutdown = False
+        self.dex_routers = {}
+        self.min_liquidity_usd = 5000   # Lower minimum liquidity to $5k
+        self.max_hops = 3  # Maximum number of DEX hops in a path
+
+        # Initialize statistics
+        self.stats = {
+            'opportunities_found': 0,
+            'successful_trades': 0,
+            'failed_trades': 0,
+            'total_profit_eth': Decimal('0'),
+            'total_profit_usd': Decimal('0'),
+            'total_gas_used': Decimal('0')
+        }
 
     async def initialize(self):
         """Initialize the bot asynchronously"""
@@ -41,23 +50,30 @@ class ArbitrageBot:
             return
 
         try:
-            print("\n🤖 Initializing Arbitrage Bot...")
+            print("\n🤖 Initializing Multi-DEX Arbitrage Bot...")
             
-            # Initialize contracts
+            # Initialize DEX routers
             print("\nConnecting to DEX routers...")
-            self.uniswap_router = self.contracts.get_dex_router(self.config.uniswap_router)
-            print("✅ Connected to Uniswap Router")
-            self.sushiswap_router = self.contracts.get_dex_router(self.config.sushiswap_router)
-            print("✅ Connected to Sushiswap Router")
+            supported_dexes = self.contracts.get_supported_dexes()
+            for dex_id in supported_dexes:
+                dex_info = self.contracts.get_dex_info(dex_id)
+                if not dex_info:
+                    continue
+                    
+                router = self.contracts.get_dex_router(dex_id)
+                if router:
+                    self.dex_routers[dex_id] = router
+                    print(f"✅ Connected to {dex_info['name']}")
             
-            # Initialize token discovery and get initial token list
+            # Initialize token discovery
             print("\nDiscovering tokens...")
             await self.config.update_token_list()
             
-            # Initialize pairs and approve tokens
+            # Initialize pairs
             await self._initialize_pairs()
             
             print(f"\n✅ Initialized with {len(self.config.token_addresses)} tokens")
+            print(f"✅ Connected to {len(self.dex_routers)} DEXes")
             self._initialized = True
             
             # Start token list update loop
@@ -88,7 +104,7 @@ class ArbitrageBot:
             logger.error(f"Error during cleanup: {str(e)}")
 
     async def _initialize_pairs(self):
-        """Initialize trading pairs and approve tokens"""
+        """Initialize trading pairs"""
         try:
             print("Initializing trading pairs...")
             
@@ -98,6 +114,7 @@ class ArbitrageBot:
             
             # Get discovered tokens data
             discovered_tokens = self.config.token_discovery.get_discovered_tokens()
+            supported_dexes = self.contracts.get_supported_dexes()
             
             for token_id, token_data in discovered_tokens.items():
                 symbol = token_data['symbol']
@@ -115,64 +132,48 @@ class ArbitrageBot:
                     print(f"✅ Initialized {symbol} contract")
                 
                 # Process DEX pairs
-                for pair in token_data.get('pairs', []):
-                    pair_name = f"{symbol}-{pair['dex'].upper()}"
-                    self.trading_pairs[pair_name] = {
-                        'tokens': [symbol, 'WETH'],  # Assuming pairs with WETH
-                        'addresses': {
-                            symbol: address,
-                            'WETH': self.config.token_addresses.get('WETH')
-                        },
-                        'dex': pair['dex'],
-                        'liquidity_usd': pair['liquidity_usd'],
-                        'volume_usd': pair['volume_usd']
-                    }
+                for dex_id in supported_dexes:
+                    if not await self.contracts.verify_dex_security(dex_id):
+                        continue
+
+                    # Check liquidity on this DEX
+                    if await self.market_utils.check_liquidity(
+                        dex_id,
+                        address,
+                        self.contracts.TOKENS['WETH'],
+                        self.min_liquidity_usd
+                    ):
+                        pair_name = f"{symbol}-{dex_id.upper()}"
+                        self.trading_pairs[pair_name] = {
+                            'token': symbol,
+                            'dex_id': dex_id,
+                            'address': address,
+                        }
             
             # Update token contracts
             self.token_contracts = new_token_contracts
-            
             print(f"\nInitialized {len(self.trading_pairs)} trading pairs")
-            
-            print("\nApproving tokens for trading...")
-            # Approve tokens
-            for token_symbol, contract in self.token_contracts.items():
-                await self._approve_token(
-                    contract.address,
-                    [self.config.uniswap_router, self.config.sushiswap_router]
-                )
-                print(f"✅ {token_symbol} approved for trading")
                 
         except Exception as e:
             logger.error(f"Error initializing pairs: {str(e)}")
             raise
 
-    async def _approve_token(self, token_address: str, spender_addresses: List[str]):
-        """Approve token for multiple spenders"""
-        for spender in spender_addresses:
-            try:
-                await self.contracts.check_and_approve_token(
-                    token_address,
-                    spender,
-                    self.config.wallet_address,
-                    self.config.private_key
-                )
-            except Exception as e:
-                logger.error(f"Error approving token {token_address} for {spender}: {str(e)}")
-                raise
-
     async def monitor_opportunities(self):
-        """Monitor for arbitrage opportunities"""
+        """Monitor for arbitrage opportunities across all DEXes"""
         if not self._initialized:
             raise RuntimeError("Bot not initialized. Call initialize() first.")
 
-        print("\n🔍 Starting arbitrage monitoring...")
-        print(f"Monitoring {len(self.trading_pairs)} trading pairs:")
+        print("\n🔍 Starting multi-DEX arbitrage monitoring...")
+        print(f"Monitoring {len(self.trading_pairs)} trading pairs across {len(self.dex_routers)} DEXes:")
         for pair_name in self.trading_pairs.keys():
             print(f"• {pair_name}")
         
         print(f"\nMinimum profit threshold: {self.config.min_profit_threshold} ETH")
         print(f"Maximum gas price: {self.config.max_gas_price} gwei")
+        print(f"Maximum path hops: {self.max_hops}")
         print("\nPress Ctrl+C to stop monitoring\n")
+        
+        self.last_status_update = datetime.now()  # Initialize last update time
         
         while not self._shutdown:
             try:
@@ -184,41 +185,19 @@ class ArbitrageBot:
                     await asyncio.sleep(30)
                     continue
 
-                # Check opportunities for each pair
+                # Check opportunities for each token
                 for pair_name, pair_data in self.trading_pairs.items():
-                    await self._check_pair_opportunity(pair_name, pair_data)
+                    await self._check_token_opportunities(
+                        pair_data['token'],
+                        pair_data['address']
+                    )
                 
                 # Send periodic status update every 5 minutes
                 current_time = datetime.now()
-                if not hasattr(self, 'last_status_update') or (current_time - self.last_status_update).seconds >= 300:
+                if (current_time - self.last_status_update).seconds >= 300:
                     if self.notifier:
-                        eth_balance = self.w3.eth.get_balance(self.config.wallet_address)
-                        eth_balance_formatted = self.w3.from_wei(eth_balance, 'ether')
-                        
-                        token_balances = {}
-                        for symbol, contract in self.token_contracts.items():
-                            balance = await self.contracts.get_token_balance(contract, self.config.wallet_address)
-                            decimals = await self.contracts.get_token_decimals(contract)
-                            formatted_balance = balance / 10**decimals
-                            token_balances[symbol] = f"{formatted_balance:.6f}"
-                        
-                        runtime = current_time - self.start_time
-                        hours = runtime.total_seconds() / 3600
-                        
-                        await self.notifier.send_status_update({
-                            'eth_price': await self.market_utils.get_eth_price(),
-                            'gas_price': self.w3.from_wei(self.w3.eth.gas_price, 'gwei'),
-                            'block_number': self.w3.eth.block_number,
-                            'eth_balance': f"{eth_balance_formatted:.6f}",
-                            'token_balances': token_balances,
-                            'opportunities_found': self.config.stats['opportunities_found'],
-                            'successful_trades': self.config.stats['successful_trades'],
-                            'failed_trades': self.config.stats['failed_trades'],
-                            'total_profit': f"{self.config.stats['total_profit_eth']:.6f}",
-                            'start_time': self.start_time.strftime("%Y-%m-%d %H:%M:%S"),
-                            'runtime_hours': f"{hours:.2f}"
-                        })
-                        self.last_status_update = current_time
+                        await self._send_status_update()
+                    self.last_status_update = current_time
                 
                 # Check shutdown flag before sleep
                 if self._shutdown:
@@ -234,135 +213,163 @@ class ArbitrageBot:
                 logger.error(f"Error in monitoring loop: {str(e)}")
                 await asyncio.sleep(1)
 
-    async def _check_pair_opportunity(self, pair_name: str, pair_data: Dict):
-        """Check arbitrage opportunity for a specific pair"""
+    async def _check_token_opportunities(self, token_symbol: str, token_address: str):
+        """Check arbitrage opportunities for a specific token across all DEXes"""
         try:
-            token0_symbol, token1_symbol = pair_data['tokens']
-            token0_contract = self.token_contracts[token0_symbol]
-            token1_contract = self.token_contracts[token1_symbol]
+            # Get token balance
+            token_contract = self.token_contracts[token_symbol]
+            balance = await self.contracts.get_token_balance(token_contract, self.config.wallet_address)
             
-            # Get balances
-            token0_balance = await self.contracts.get_token_balance(token0_contract, self.config.wallet_address)
-            token1_balance = await self.contracts.get_token_balance(token1_contract, self.config.wallet_address)
-            
-            if token0_balance > 0:
-                await self._check_token_arbitrage(
-                    token0_symbol,
-                    token0_balance,
-                    token0_contract,
-                    token1_contract
-                )
-                
-            if token1_balance > 0:
-                await self._check_token_arbitrage(
-                    token1_symbol,
-                    token1_balance,
-                    token1_contract,
-                    token0_contract
-                )
-                
-        except Exception as e:
-            logger.error(f"Error checking {pair_name} opportunity: {str(e)}")
+            if balance == 0:
+                return
 
-    async def _check_token_arbitrage(
-        self,
-        token_symbol: str,
-        balance: int,
-        token_contract: Contract,
-        other_token_contract: Contract
-    ):
-        """Check arbitrage opportunity for a specific token"""
-        try:
-            # Get token decimals
-            decimals = await self.contracts.get_token_decimals(token_contract)
-            
-            # Calculate arbitrage
-            path1 = [token_contract.address, other_token_contract.address]
-            path2 = [other_token_contract.address, token_contract.address]
-            
-            opportunity = await self.market_utils.calculate_profitability(
+            # Find best arbitrage path
+            best_path = await self.market_utils.find_arbitrage_path(
+                token_address,
                 balance,
-                decimals,
-                path1,
-                path2,
-                token_symbol,
-                'uniswap',
-                'sushiswap'
+                self.max_hops
             )
-            
-            if opportunity['profitable']:
-                logger.info(f"\n💰 Found profitable {token_symbol} arbitrage!")
-                logger.info(f"Expected profit: {opportunity['net_profit_token']:.6f} {token_symbol}")
-                logger.info(f"ROI: {opportunity['roi']:.2f}%")
-                
+
+            if best_path and best_path['profit_data']['profitable']:
+                profit_data = best_path['profit_data']
+                dex_path = best_path['dex_path']
+
+                logger.info(f"\n💰 Found profitable {token_symbol} arbitrage opportunity!")
+                logger.info(f"Path: {' -> '.join(dex_path)}")
+                logger.info(f"Expected profit: ${float(profit_data['net_profit_usd']):.2f}")
+                logger.info(f"ROI: {float(profit_data['roi']):.2f}%")
+
+                self.stats['opportunities_found'] += 1
+
                 if await self.config.is_gas_price_acceptable():
-                    # Execute trade if profitable
-                    await self._execute_arbitrage(
+                    await self._execute_arbitrage_path(
                         token_symbol,
                         balance,
-                        path1,
-                        path2,
-                        opportunity
+                        dex_path,
+                        profit_data
                     )
                 else:
                     logger.info("⚠️ Gas price too high, skipping trade")
-            
-        except Exception as e:
-            logger.error(f"Error checking {token_symbol} arbitrage: {str(e)}")
 
-    async def _execute_arbitrage(
+        except Exception as e:
+            logger.error(f"Error checking {token_symbol} opportunities: {str(e)}")
+
+    async def _execute_arbitrage_path(
         self,
         token_symbol: str,
         amount: int,
-        path1: List[str],
-        path2: List[str],
-        opportunity: Dict
+        dex_path: List[str],
+        profit_data: Dict
     ):
-        """Execute arbitrage trades"""
+        """Execute arbitrage trades along the optimal path"""
         try:
-            logger.info(f"\n🔄 Executing {token_symbol} arbitrage...")
+            logger.info(f"\n🔄 Executing {token_symbol} arbitrage along path: {' -> '.join(dex_path)}")
             
-            # Execute trades
-            success = await self.contracts.execute_trades(
-                amount,
-                path1,
-                path2,
-                self.config.wallet_address,
-                self.config.private_key
-            )
+            current_amount = amount
+            success = True
+            
+            # Execute trades along the path
+            for i in range(len(dex_path) - 1):
+                from_dex = dex_path[i]
+                to_dex = dex_path[i + 1]
+                
+                # Execute trade between these DEXes
+                result = await self.contracts.execute_trade(
+                    from_dex,
+                    current_amount,
+                    [self.token_contracts[token_symbol].address],
+                    self.config.wallet_address,
+                    int(time.time()) + 300,  # 5 minutes deadline
+                    self.config.private_key
+                )
+                
+                if not result:
+                    success = False
+                    break
+                
+                # Update amount for next trade
+                current_amount = await self.contracts.get_token_balance(
+                    self.token_contracts[token_symbol],
+                    self.config.wallet_address
+                )
             
             if success:
                 logger.info("✅ Arbitrage executed successfully!")
                 # Update statistics
-                self.config.stats['successful_trades'] += 1
-                self.config.stats['total_profit_eth'] += opportunity['net_profit_token']
-                self.config.stats['total_profit_usd'] += opportunity['net_profit_usd']
+                self.stats['successful_trades'] += 1
+                self.stats['total_profit_eth'] += Decimal(str(profit_data['net_profit_eth']))
+                self.stats['total_profit_usd'] += Decimal(str(profit_data['net_profit_usd']))
                 
-                if self.notifier:
+                if self.notifier and self.notifier.is_enabled():
                     await self.notifier.send_execution_result(True, {
                         'token_symbol': token_symbol,
-                        'profit_token': opportunity['net_profit_token'],
-                        'profit_usd': opportunity['net_profit_usd'],
-                        'roi': opportunity['roi']
+                        'profit_token': profit_data['net_profit_eth'],
+                        'profit_usd': profit_data['net_profit_usd'],
+                        'roi': profit_data['roi'],
+                        'path': ' -> '.join(dex_path)
                     })
             else:
                 logger.error("❌ Arbitrage execution failed")
-                self.config.stats['failed_trades'] += 1
+                self.stats['failed_trades'] += 1
                 
-                if self.notifier:
+                if self.notifier and self.notifier.is_enabled():
                     await self.notifier.send_execution_result(False, {
                         'error': 'Trade execution failed'
                     })
             
         except Exception as e:
             logger.error(f"Error executing arbitrage: {str(e)}")
-            self.config.stats['failed_trades'] += 1
+            self.stats['failed_trades'] += 1
             
-            if self.notifier:
+            if self.notifier and self.notifier.is_enabled():
                 await self.notifier.send_execution_result(False, {
                     'error': str(e)
                 })
-                
+
+    async def _send_status_update(self):
+        """Send periodic status update"""
+        try:
+            network_status = await self.market_utils.get_network_status()
+            eth_balance = self.w3.eth.get_balance(self.config.wallet_address)
+            eth_balance_formatted = self.w3.from_wei(eth_balance, 'ether')
+            
+            token_balances = {}
+            for symbol, contract in self.token_contracts.items():
+                balance = await self.contracts.get_token_balance(contract, self.config.wallet_address)
+                decimals = await self.contracts.get_token_decimals(contract)
+                formatted_balance = balance / 10**decimals
+                token_balances[symbol] = formatted_balance
+            
+            runtime = datetime.now() - self.start_time
+            hours = runtime.total_seconds() / 3600
+
+            # Log network status to console
+            logger.info("\nNetwork Status:")
+            logger.info(f"ETH Price: ${network_status['eth_price_usd']}")
+            logger.info(f"Gas Price: {network_status['gas_price_gwei']} gwei")
+            logger.info(f"Block Number: {network_status['block_number']}")
+            logger.info(f"Active DEXes: {len(self.dex_routers)}")
+            
+            # Only send Telegram notification if notifier is properly configured
+            if self.notifier and self.notifier.is_enabled():
+                await self.notifier.send_status_update({
+                    'eth_price': network_status['eth_price_usd'],
+                    'gas_price': network_status['gas_price_gwei'],
+                    'block_number': network_status['block_number'],
+                    'active_dexes': len(self.dex_routers),
+                    'eth_balance': eth_balance_formatted,
+                    'token_balances': token_balances,
+                    'opportunities_found': self.stats['opportunities_found'],
+                    'successful_trades': self.stats['successful_trades'],
+                    'failed_trades': self.stats['failed_trades'],
+                    'total_profit_eth': self.stats['total_profit_eth'],
+                    'total_profit_usd': self.stats['total_profit_usd'],
+                    'start_time': self.start_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    'runtime_hours': hours
+                })
+        except Exception as e:
+            logger.error(f"Error sending status update: {str(e)}")
+
     async def stop(self):
         """Stop the bot gracefully"""
         logger.info("\n🛑 Stopping bot...")
